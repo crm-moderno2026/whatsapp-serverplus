@@ -38,12 +38,29 @@ log_error() {
     echo -e "${RED}❌ $1${NC}"
 }
 
-# Verificar se é root
+# Verificar se é root e criar usuário se necessário
 if [[ $EUID -eq 0 ]]; then
-   log_error "Este script não deve ser executado como root!"
-   log_info "Execute: bash install.sh"
-   exit 1
+   log_info "Executando como root - criando usuário whatsapp..."
+   
+   # Criar usuário whatsapp se não existir
+   if ! id "whatsapp" &>/dev/null; then
+       log_info "Criando usuário 'whatsapp'..."
+       useradd -m -s /bin/bash whatsapp
+       usermod -aG sudo whatsapp
+       
+       # Definir senha temporária
+       echo "whatsapp:whatsapp123" | chpasswd
+       log_warning "Senha temporária para usuário whatsapp: whatsapp123"
+       log_warning "Altere a senha após a instalação!"
+   fi
+   
+   # Continuar instalação como usuário whatsapp
+   log_info "Continuando instalação como usuário whatsapp..."
+   exec sudo -u whatsapp -H bash "$0" "$@"
 fi
+
+# A partir daqui, executa como usuário whatsapp
+log_info "Executando como usuário: $(whoami)"
 
 # Atualizar sistema
 log_info "Atualizando sistema..."
@@ -68,33 +85,15 @@ log_success "NPM instalado: $NPM_VERSION"
 log_info "Instalando PM2..."
 sudo npm install -g pm2
 
-# Criar usuário para o WhatsApp (se não existir)
-if ! id "whatsapp" &>/dev/null; then
-    log_info "Criando usuário 'whatsapp'..."
-    sudo useradd -m -s /bin/bash whatsapp
-    sudo usermod -aG sudo whatsapp
-fi
-
 # Criar diretório do projeto
 PROJECT_DIR="/home/whatsapp/whatsapp-server"
 log_info "Criando diretório do projeto: $PROJECT_DIR"
-sudo mkdir -p $PROJECT_DIR
-sudo chown whatsapp:whatsapp $PROJECT_DIR
-
-# Baixar código do servidor
-log_info "Baixando código do servidor..."
-cd /tmp
-cat > whatsapp-server.tar.gz << 'EOF'
-# Aqui seria o código compactado, mas vamos criar os arquivos diretamente
-EOF
-
-# Criar estrutura do projeto
-log_info "Criando estrutura do projeto..."
-sudo -u whatsapp mkdir -p $PROJECT_DIR/{sessions,logs}
+mkdir -p $PROJECT_DIR
+mkdir -p $PROJECT_DIR/{sessions,logs}
 
 # Criar package.json
 log_info "Criando package.json..."
-sudo -u whatsapp tee $PROJECT_DIR/package.json > /dev/null << 'EOF'
+cat > $PROJECT_DIR/package.json << 'EOF'
 {
   "name": "whatsapp-server",
   "version": "1.0.0",
@@ -130,7 +129,7 @@ EOF
 
 # Criar server.js
 log_info "Criando server.js..."
-sudo -u whatsapp tee $PROJECT_DIR/server.js > /dev/null << 'EOF'
+cat > $PROJECT_DIR/server.js << 'EOF'
 const express = require("express")
 const cors = require("cors")
 const helmet = require("helmet")
@@ -620,7 +619,7 @@ EOF
 
 # Criar arquivo de configuração do PM2
 log_info "Criando configuração do PM2..."
-sudo -u whatsapp tee $PROJECT_DIR/ecosystem.config.js > /dev/null << 'EOF'
+cat > $PROJECT_DIR/ecosystem.config.js << 'EOF'
 module.exports = {
   apps: [{
     name: 'whatsapp-server',
@@ -647,8 +646,8 @@ EOF
 
 # Criar arquivo .env
 log_info "Criando arquivo .env..."
-API_KEY_GENERATED=$(openssl rand -hex 32)
-sudo -u whatsapp tee $PROJECT_DIR/.env > /dev/null << EOF
+API_KEY_GENERATED=$(openssl rand -hex 32 2>/dev/null || echo "whatsapp-$(date +%s)-$(shuf -i 1000-9999 -n 1)")
+cat > $PROJECT_DIR/.env << EOF
 # Configurações do Servidor WhatsApp
 NODE_ENV=production
 PORT=3001
@@ -670,7 +669,7 @@ EOF
 # Instalar dependências
 log_info "Instalando dependências do Node.js..."
 cd $PROJECT_DIR
-sudo -u whatsapp npm install
+npm install
 
 # Configurar PM2 para iniciar no boot
 log_info "Configurando PM2 para iniciar no boot..."
@@ -678,14 +677,133 @@ sudo env PATH=$PATH:/usr/bin /usr/lib/node_modules/pm2/bin/pm2 startup systemd -
 
 # Iniciar aplicação com PM2
 log_info "Iniciando aplicação com PM2..."
-sudo -u whatsapp pm2 start ecosystem.config.js
-sudo -u whatsapp pm2 save
+pm2 start ecosystem.config.js
+pm2 save
 
 # Configurar firewall
 log_info "Configurando firewall..."
 sudo ufw allow 3001/tcp
 sudo ufw allow ssh
 sudo ufw --force enable
+
+# Criar script de monitoramento
+log_info "Criando script de monitoramento..."
+cat > $PROJECT_DIR/monitor.sh << 'EOF'
+#!/bin/bash
+
+# Script de monitoramento do WhatsApp Server
+
+echo "📊 Status do WhatsApp Server"
+echo "=========================="
+
+# Status do PM2
+echo "🔄 Status PM2:"
+pm2 status whatsapp-server
+
+echo ""
+
+# Status da aplicação
+echo "🌐 Status da Aplicação:"
+curl -s http://localhost:3001/api/health | python3 -m json.tool 2>/dev/null || echo "Aplicação não responde"
+
+echo ""
+
+# Uso de recursos
+echo "💾 Uso de Recursos:"
+echo "CPU: $(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | awk -F'%' '{print $1}' || echo "N/A")"
+echo "RAM: $(free -h | awk '/^Mem:/ {print $3 "/" $2}' || echo "N/A")"
+echo "Disco: $(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 " usado)"}' || echo "N/A")"
+
+echo ""
+
+# Logs recentes
+echo "📋 Logs Recentes:"
+pm2 logs whatsapp-server --lines 5 --nostream
+EOF
+
+chmod +x $PROJECT_DIR/monitor.sh
+
+# Criar script de backup
+log_info "Criando script de backup..."
+cat > $PROJECT_DIR/backup.sh << 'EOF'
+#!/bin/bash
+
+# Script de backup das sessões WhatsApp
+
+BACKUP_DIR="/home/whatsapp/backups"
+DATE=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="whatsapp_sessions_$DATE.tar.gz"
+
+mkdir -p $BACKUP_DIR
+
+echo "📦 Criando backup das sessões..."
+tar -czf $BACKUP_DIR/$BACKUP_FILE -C /home/whatsapp/whatsapp-server sessions/
+
+echo "✅ Backup criado: $BACKUP_DIR/$BACKUP_FILE"
+
+# Manter apenas os 7 backups mais recentes
+find $BACKUP_DIR -name "whatsapp_sessions_*.tar.gz" -type f -mtime +7 -delete
+
+echo "🧹 Backups antigos removidos"
+EOF
+
+chmod +x $PROJECT_DIR/backup.sh
+
+# Configurar cron para backup diário
+log_info "Configurando backup automático..."
+(crontab -l 2>/dev/null; echo "0 2 * * * /home/whatsapp/whatsapp-server/backup.sh >> /home/whatsapp/whatsapp-server/logs/backup.log 2>&1") | crontab -
+
+# Aguardar um pouco para o servidor iniciar
+log_info "Aguardando servidor iniciar..."
+sleep 5
+
+# Testar se o servidor está funcionando
+log_info "Testando servidor..."
+if curl -s http://localhost:3001/ > /dev/null; then
+    log_success "Servidor está respondendo!"
+else
+    log_warning "Servidor pode não estar respondendo ainda. Verifique os logs."
+fi
+
+# Obter IP público
+PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || curl -s ipinfo.io/ip 2>/dev/null || echo "SEU-IP")
+
+# Mostrar informações finais
+echo ""
+echo "🎉 INSTALAÇÃO CONCLUÍDA COM SUCESSO!"
+echo "=================================="
+echo ""
+log_success "WhatsApp Server instalado e rodando!"
+echo ""
+echo "📋 INFORMAÇÕES IMPORTANTES:"
+echo "   • Servidor rodando na porta: 3001"
+echo "   • API Key: $API_KEY_GENERATED"
+echo "   • Usuário: whatsapp"
+echo "   • Diretório: $PROJECT_DIR"
+echo "   • IP Público: $PUBLIC_IP"
+echo ""
+echo "🔧 COMANDOS ÚTEIS:"
+echo "   • Ver status: pm2 status"
+echo "   • Ver logs: pm2 logs whatsapp-server"
+echo "   • Reiniciar: pm2 restart whatsapp-server"
+echo "   • Monitorar: $PROJECT_DIR/monitor.sh"
+echo "   • Backup: $PROJECT_DIR/backup.sh"
+echo ""
+echo "🌐 TESTE A INSTALAÇÃO:"
+echo "   curl http://localhost:3001/api/health"
+echo "   curl http://$PUBLIC_IP:3001/api/health"
+echo ""
+echo "⚙️  CONFIGURAR NO SEU CRM:"
+echo "   WHATSAPP_SERVER_URL=http://$PUBLIC_IP:3001"
+echo "   WHATSAPP_API_KEY=$API_KEY_GENERATED"
+echo ""
+
+log_warning "IMPORTANTE: Anote a API Key em local seguro!"
+log_warning "Ela será necessária para conectar seu CRM ao servidor."
+
+echo ""
+log_info "Para ver o status atual, execute:"
+echo "$PROJECT_DIR/monitor.sh"
 
 # Perguntar sobre Nginx
 echo ""
@@ -734,8 +852,12 @@ EOF
     
     log_success "Nginx configurado com sucesso!"
     
-    # Perguntar sobre SSL
     echo ""
+    echo "🌍 NGINX CONFIGURADO:"
+    echo "   • Acesse: http://$PUBLIC_IP/api/health"
+    echo ""
+    
+    # Perguntar sobre SSL
     read -p "🔒 Deseja configurar SSL com Let's Encrypt? (y/n): " install_ssl
     
     if [[ $install_ssl =~ ^[Yy]$ ]]; then
@@ -746,120 +868,20 @@ EOF
             sudo apt install -y certbot python3-certbot-nginx
             
             log_info "Configurando SSL para $domain..."
-            sudo certbot --nginx -d $domain --non-interactive --agree-tos --email admin@$domain
+            sudo certbot --nginx -d $domain --non-interactive --agree-tos --email admin@$domain --redirect
             
             log_success "SSL configurado para $domain!"
+            
+            echo ""
+            echo "🔒 SSL CONFIGURADO:"
+            echo "   • Acesse: https://$domain/api/health"
+            echo ""
+            echo "⚙️  CONFIGURAR NO SEU CRM:"
+            echo "   WHATSAPP_SERVER_URL=https://$domain"
+            echo "   WHATSAPP_API_KEY=$API_KEY_GENERATED"
         fi
     fi
 fi
 
-# Criar script de monitoramento
-log_info "Criando script de monitoramento..."
-sudo -u whatsapp tee $PROJECT_DIR/monitor.sh > /dev/null << 'EOF'
-#!/bin/bash
-
-# Script de monitoramento do WhatsApp Server
-
-echo "📊 Status do WhatsApp Server"
-echo "=========================="
-
-# Status do PM2
-echo "🔄 Status PM2:"
-pm2 status whatsapp-server
-
 echo ""
-
-# Status da aplicação
-echo "🌐 Status da Aplicação:"
-curl -s http://localhost:3001/api/health | jq '.' 2>/dev/null || echo "Aplicação não responde"
-
-echo ""
-
-# Uso de recursos
-echo "💾 Uso de Recursos:"
-echo "CPU: $(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | awk -F'%' '{print $1}')"
-echo "RAM: $(free -h | awk '/^Mem:/ {print $3 "/" $2}')"
-echo "Disco: $(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 " usado)"}')"
-
-echo ""
-
-# Logs recentes
-echo "📋 Logs Recentes:"
-pm2 logs whatsapp-server --lines 5 --nostream
-EOF
-
-chmod +x $PROJECT_DIR/monitor.sh
-
-# Criar script de backup
-log_info "Criando script de backup..."
-sudo -u whatsapp tee $PROJECT_DIR/backup.sh > /dev/null << 'EOF'
-#!/bin/bash
-
-# Script de backup das sessões WhatsApp
-
-BACKUP_DIR="/home/whatsapp/backups"
-DATE=$(date +%Y%m%d_%H%M%S)
-BACKUP_FILE="whatsapp_sessions_$DATE.tar.gz"
-
-mkdir -p $BACKUP_DIR
-
-echo "📦 Criando backup das sessões..."
-tar -czf $BACKUP_DIR/$BACKUP_FILE -C /home/whatsapp/whatsapp-server sessions/
-
-echo "✅ Backup criado: $BACKUP_DIR/$BACKUP_FILE"
-
-# Manter apenas os 7 backups mais recentes
-find $BACKUP_DIR -name "whatsapp_sessions_*.tar.gz" -type f -mtime +7 -delete
-
-echo "🧹 Backups antigos removidos"
-EOF
-
-chmod +x $PROJECT_DIR/backup.sh
-
-# Configurar cron para backup diário
-log_info "Configurando backup automático..."
-(sudo -u whatsapp crontab -l 2>/dev/null; echo "0 2 * * * /home/whatsapp/whatsapp-server/backup.sh >> /home/whatsapp/whatsapp-server/logs/backup.log 2>&1") | sudo -u whatsapp crontab -
-
-# Mostrar informações finais
-echo ""
-echo "🎉 INSTALAÇÃO CONCLUÍDA COM SUCESSO!"
-echo "=================================="
-echo ""
-log_success "WhatsApp Server instalado e rodando!"
-echo ""
-echo "📋 INFORMAÇÕES IMPORTANTES:"
-echo "   • Servidor rodando na porta: 3001"
-echo "   • API Key: $API_KEY_GENERATED"
-echo "   • Usuário: whatsapp"
-echo "   • Diretório: $PROJECT_DIR"
-echo ""
-echo "🔧 COMANDOS ÚTEIS:"
-echo "   • Ver status: sudo -u whatsapp pm2 status"
-echo "   • Ver logs: sudo -u whatsapp pm2 logs whatsapp-server"
-echo "   • Reiniciar: sudo -u whatsapp pm2 restart whatsapp-server"
-echo "   • Monitorar: sudo -u whatsapp $PROJECT_DIR/monitor.sh"
-echo "   • Backup: sudo -u whatsapp $PROJECT_DIR/backup.sh"
-echo ""
-echo "🌐 TESTE A INSTALAÇÃO:"
-echo "   curl http://localhost:3001/api/health"
-echo ""
-
-if [[ $install_nginx =~ ^[Yy]$ ]]; then
-    echo "🌍 NGINX CONFIGURADO:"
-    echo "   • Acesse: http://$(curl -s ifconfig.me)/api/health"
-    echo "   • Ou: http://seu-dominio.com/api/health"
-    echo ""
-fi
-
-echo "⚙️  CONFIGURAR NO SEU CRM:"
-echo "   WHATSAPP_SERVER_URL=http://$(curl -s ifconfig.me):3001"
-echo "   WHATSAPP_API_KEY=$API_KEY_GENERATED"
-echo ""
-
-log_warning "IMPORTANTE: Anote a API Key em local seguro!"
-log_warning "Ela será necessária para conectar seu CRM ao servidor."
-
-echo ""
-log_info "Para ver o status atual, execute:"
-echo "sudo -u whatsapp $PROJECT_DIR/monitor.sh"
-EOF
+log_success "🎉 Instalação finalizada! Execute '$PROJECT_DIR/monitor.sh' para ver o status."
