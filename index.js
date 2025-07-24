@@ -11,7 +11,7 @@ if (!fs.existsSync(SESSION_FILE)) {
   fs.writeFileSync(SESSION_FILE, JSON.stringify({}))
 }
 
-const { state, saveCreds } = useSingleFileAuthState(SESSION_FILE)
+const { useSingleFileAuthState } = require('@whiskeysockets/baileys/lib/auth-utils');
 
 const app = express()
 app.use(cors())
